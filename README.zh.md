@@ -19,6 +19,10 @@
 
 EmotiVoice提供一个易于使用的web界面，还有用于批量生成结果的脚本接口。
 
+本 fork 还在 [`creator_tools`](creator_tools/README.md) 中提供面向 Creator
+工作台的中文音色筛选界面和离线 CAM++ 相似音色搜索。大模型权重、参考音频和本地
+分析结果仍保存在 Git 之外。
+
 以下是EmotiVoice生成的几个示例:
 
 - [Chinese audio sample](https://github.com/netease-youdao/EmotiVoice/assets/3909232/6426d7c1-d620-4bfc-ba03-cd7fc046a4fb)

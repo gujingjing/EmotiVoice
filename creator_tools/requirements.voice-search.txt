@@ -1,0 +1,4 @@
+numpy>=1.24
+openpyxl>=3.1
+sherpa-onnx>=1.12
+soundfile>=0.12
