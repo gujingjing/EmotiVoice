@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from functools import lru_cache
 import json
 import math
 import os
@@ -96,39 +97,17 @@ def embedding_from_wav(extractor, path: Path) -> np.ndarray:
     return embedding_from_samples(extractor, samples[:, 0], sample_rate)
 
 
-def probe_duration(path: Path) -> float:
+def decode_media(path: Path, output: Path) -> None:
+    ffmpeg = os.environ.get("FFMPEG_BINARY", "ffmpeg")
     result = subprocess.run(
         [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return float(result.stdout.strip())
-
-
-def extract_segment(path: Path, output: Path, start: float, duration: float) -> None:
-    subprocess.run(
-        [
-            "ffmpeg",
+            ffmpeg,
             "-hide_banner",
             "-loglevel",
             "error",
             "-y",
-            "-ss",
-            f"{start:.3f}",
             "-i",
             str(path),
-            "-t",
-            f"{duration:.3f}",
             "-vn",
             "-ac",
             "1",
@@ -140,38 +119,43 @@ def extract_segment(path: Path, output: Path, start: float, duration: float) -> 
             "highpass=f=70,lowpass=f=7800",
             str(output),
         ],
-        check=True,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    if result.returncode:
+        details = result.stderr.strip() or f"退出代码 {result.returncode}"
+        raise ValueError(f"FFmpeg 无法解码该音视频：{details}")
 
 
 def embedding_from_media(extractor, path: Path) -> np.ndarray:
-    duration = probe_duration(path)
+    with tempfile.TemporaryDirectory(prefix="emotivoice-search-") as temp_dir:
+        wav_path = Path(temp_dir) / "decoded.wav"
+        decode_media(path, wav_path)
+        samples, sample_rate = sf.read(
+            wav_path,
+            always_2d=True,
+            dtype="float32",
+        )
+
+    mono = samples[:, 0]
+    duration = len(mono) / sample_rate
     if duration <= 0:
         raise ValueError(f"Audio duration is invalid: {path}")
-
     if duration <= SEGMENT_SECONDS * 1.5:
-        segments = [(0.0, duration)]
+        segments = [(0, len(mono))]
     else:
-        segments = [
-            (
-                max(
-                    0.0,
-                    min(
-                        duration - SEGMENT_SECONDS,
-                        duration * position - SEGMENT_SECONDS / 2,
-                    ),
-                ),
-                min(SEGMENT_SECONDS, duration),
-            )
-            for position in SEGMENT_POSITIONS
-        ]
+        segment_size = int(SEGMENT_SECONDS * sample_rate)
+        segments = []
+        for position in SEGMENT_POSITIONS:
+            center = int(len(mono) * position)
+            start = max(0, min(len(mono) - segment_size, center - segment_size // 2))
+            segments.append((start, start + segment_size))
 
-    embeddings = []
-    with tempfile.TemporaryDirectory(prefix="emotivoice-search-") as temp_dir:
-        for index, (start, segment_duration) in enumerate(segments):
-            wav_path = Path(temp_dir) / f"segment-{index}.wav"
-            extract_segment(path, wav_path, start, segment_duration)
-            embeddings.append(embedding_from_wav(extractor, wav_path))
+    embeddings = [
+        embedding_from_samples(extractor, mono[start:end], sample_rate)
+        for start, end in segments
+    ]
     return normalize(np.mean(np.stack(embeddings), axis=0))
 
 
@@ -322,17 +306,58 @@ def search_embedding(
     return results
 
 
-def search_audio(args) -> list[dict[str, object]]:
-    metadata = load_metadata(args.metadata)
-    speaker_ids, embeddings = load_index(args.index)
-    extractor = create_extractor(args.model, args.num_threads)
-    query = embedding_from_media(extractor, args.input)
-    results = search_embedding(
+@lru_cache(maxsize=2)
+def load_search_resources(
+    model_path: str,
+    index_path: str,
+    metadata_path: str,
+    num_threads: int,
+):
+    metadata = load_metadata(Path(metadata_path))
+    speaker_ids, embeddings = load_index(Path(index_path))
+    extractor = create_extractor(Path(model_path), num_threads)
+    return metadata, speaker_ids, embeddings, extractor
+
+
+def find_similar_voices(
+    input_path: Path,
+    *,
+    model_path: Path = DEFAULT_MODEL,
+    index_path: Path = DEFAULT_INDEX,
+    metadata_path: Path = DEFAULT_METADATA,
+    top_k: int = 8,
+    num_threads: int = 4,
+) -> list[dict[str, object]]:
+    required = [model_path, index_path, metadata_path]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "声音检索文件不完整：\n" + "\n".join(missing)
+        )
+    metadata, speaker_ids, embeddings, extractor = load_search_resources(
+        str(model_path.resolve()),
+        str(index_path.resolve()),
+        str(metadata_path.resolve()),
+        num_threads,
+    )
+    query = embedding_from_media(extractor, input_path)
+    return search_embedding(
         query,
         speaker_ids,
         embeddings,
         metadata,
-        args.top_k,
+        top_k,
+    )
+
+
+def search_audio(args) -> list[dict[str, object]]:
+    results = find_similar_voices(
+        args.input,
+        model_path=args.model,
+        index_path=args.index,
+        metadata_path=args.metadata,
+        top_k=args.top_k,
+        num_threads=args.num_threads,
     )
     if args.json:
         print(json.dumps(results, ensure_ascii=False))
